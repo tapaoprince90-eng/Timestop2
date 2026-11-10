@@ -1,1 +1,221 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
+      - name: Create mod files
+        run: |
+          mkdir -p src/main/java/com/example/timestop/mixin
+          mkdir -p src/main/resources
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx1G
+          org.gradle.parallel=true
+          minecraft_version=1.21.1
+          yarn_mappings=1.21.1+build.3
+          loader_version=0.16.5
+          mod_version=1.0.0
+          maven_group=com.example
+          archives_base_name=timestop
+          fabric_version=0.102.0+1.21.1
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'fabric-loom' version '1.7-SNAPSHOT'
+              id 'maven-publish'
+          }
+          version = project.mod_version
+          group = project.maven_group
+          base {
+              archivesName = project.archives_base_name
+          }
+          repositories {}
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") {
+                  expand "version": project.version
+              }
+          }
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 21
+          }
+          java {
+              withSourcesJar()
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          EOF
+
+          cat > src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "timestop",
+            "version": "${version}",
+            "name": "Time Stop Compass",
+            "description": "Hold the TIME STOP compass to slow the game down to 2 TPS.",
+            "authors": ["You"],
+            "environment": "*",
+            "entrypoints": {
+              "main": ["com.example.timestop.TimeStopMod"]
+            },
+            "mixins": ["timestop.mixins.json"],
+            "depends": {
+              "fabricloader": ">=0.16.0",
+              "minecraft": "~1.21.1",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          EOF
+
+          cat > src/main/resources/timestop.mixins.json <<'EOF'
+          {
+            "required": true,
+            "package": "com.example.timestop.mixin",
+            "compatibilityLevel": "JAVA_21",
+            "client": ["SoundSystemMixin"],
+            "injectors": { "defaultRequire": 1 }
+          }
+          EOF
+
+          cat > src/main/java/com/example/timestop/TimeStopMod.java <<'EOF'
+          package com.example.timestop;
+
+          import net.fabricmc.api.ModInitializer;
+          import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+          import net.minecraft.component.DataComponentTypes;
+          import net.minecraft.component.type.NbtComponent;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.item.Items;
+          import net.minecraft.nbt.NbtCompound;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.ServerTickManager;
+          import net.minecraft.server.command.CommandManager;
+          import net.minecraft.server.network.ServerPlayerEntity;
+          import net.minecraft.text.Style;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.Formatting;
+
+          public class TimeStopMod implements ModInitializer {
+
+              private static final String TAG = "timestop_compass";
+              private static final float SLOW_TPS = 2.0f;
+              private static final float NORMAL_TPS = 20.0f;
+
+              private boolean slowed = false;
+
+              @Override
+              public void onInitialize() {
+                  CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) ->
+                      dispatcher.register(CommandManager.literal("timestop").executes(ctx -> {
+                          ServerPlayerEntity player = ctx.getSource().getPlayerOrThrow();
+                          player.giveItemStack(createCompass());
+                          ctx.getSource().sendFeedback(
+                              () -> Text.literal("You received the TIME STOP compass."), false);
+                          return 1;
+                      }))
+                  );
+                  ServerTickEvents.END_SERVER_TICK.register(this::onServerTick);
+              }
+
+              public static ItemStack createCompass() {
+                  ItemStack stack = new ItemStack(Items.COMPASS);
+                  stack.set(DataComponentTypes.CUSTOM_NAME,
+                      Text.literal("TIME STOP").setStyle(
+                          Style.EMPTY.withColor(Formatting.AQUA).withBold(true).withItalic(false)));
+                  stack.set(DataComponentTypes.ENCHANTMENT_GLINT_OVERRIDE, true);
+                  NbtCompound nbt = new NbtCompound();
+                  nbt.putBoolean(TAG, true);
+                  stack.set(DataComponentTypes.CUSTOM_DATA, NbtComponent.of(nbt));
+                  return stack;
+              }
+
+              private static boolean isTimeStop(ItemStack stack) {
+                  if (stack.isEmpty() || !stack.isOf(Items.COMPASS)) return false;
+                  return stack.getOrDefault(DataComponentTypes.CUSTOM_DATA, NbtComponent.DEFAULT).contains(TAG);
+              }
+
+              private void onServerTick(MinecraftServer server) {
+                  boolean holding = false;
+                  for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
+                      if (isTimeStop(player.getMainHandStack()) || isTimeStop(player.getOffHandStack())) {
+                          holding = true;
+                          break;
+                      }
+                  }
+                  ServerTickManager tickManager = server.getTickManager();
+                  if (holding && !slowed) {
+                      tickManager.setTickRate(SLOW_TPS);
+                      slowed = true;
+                  } else if (!holding && slowed) {
+                      tickManager.setTickRate(NORMAL_TPS);
+                      slowed = false;
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/timestop/mixin/SoundSystemMixin.java <<'EOF'
+          package com.example.timestop.mixin;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.sound.SoundInstance;
+          import net.minecraft.client.sound.SoundSystem;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+          @Mixin(SoundSystem.class)
+          public class SoundSystemMixin {
+              @Inject(method = "getAdjustedPitch", at = @At("RETURN"), cancellable = true)
+              private void timestop$slowPitch(SoundInstance sound, CallbackInfoReturnable<Float> cir) {
+                  MinecraftClient client = MinecraftClient.getInstance();
+                  if (client.world == null) return;
+                  float rate = client.world.getTickManager().getTickRate();
+                  if (rate < 20.0f) {
+                      float factor = Math.max(0.4f, rate / 20.0f);
+                      cir.setReturnValue(cir.getReturnValue() * factor);
+                  }
+              }
+          }
+          EOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.8
+
+      - run: gradle build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: timestop-jar
+          path: build/libs/*.jar
