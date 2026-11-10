@@ -1,4 +1,4 @@
-name: build
+name: buildname: build
 on:
   push:
   workflow_dispatch:
@@ -11,6 +11,7 @@ jobs:
       - name: Create mod files
         run: |
           mkdir -p src/main/java/com/example/timestop/mixin
+          mkdir -p src/main/java/com/example/timestop/client
           mkdir -p src/main/resources
 
           cat > settings.gradle <<'EOF'
@@ -74,11 +75,12 @@ jobs:
             "id": "timestop",
             "version": "${version}",
             "name": "Time Stop Compass",
-            "description": "Hold the TIME STOP compass to slow the game down to 2 TPS.",
+            "description": "Right-click the TIME STOP compass to open the slow motion menu.",
             "authors": ["You"],
             "environment": "*",
             "entrypoints": {
-              "main": ["com.example.timestop.TimeStopMod"]
+              "main": ["com.example.timestop.TimeStopMod"],
+              "client": ["com.example.timestop.client.TimeStopClient"]
             },
             "mixins": ["timestop.mixins.json"],
             "depends": {
@@ -95,8 +97,34 @@ jobs:
             "required": true,
             "package": "com.example.timestop.mixin",
             "compatibilityLevel": "JAVA_21",
-            "client": ["SoundSystemMixin"],
+            "client": ["SoundSystemMixin", "MinecraftClientMixin"],
             "injectors": { "defaultRequire": 1 }
+          }
+          EOF
+
+          cat > src/main/java/com/example/timestop/SlowPayload.java <<'EOF'
+          package com.example.timestop;
+
+          import net.minecraft.network.RegistryByteBuf;
+          import net.minecraft.network.codec.PacketCodec;
+          import net.minecraft.network.codec.PacketCodecs;
+          import net.minecraft.network.packet.CustomPayload;
+          import net.minecraft.util.Identifier;
+
+          public record SlowPayload(boolean active, int tps) implements CustomPayload {
+              public static final CustomPayload.Id<SlowPayload> ID =
+                  new CustomPayload.Id<>(Identifier.of("timestop", "slow"));
+
+              public static final PacketCodec<RegistryByteBuf, SlowPayload> CODEC =
+                  PacketCodec.tuple(
+                      PacketCodecs.BOOL, SlowPayload::active,
+                      PacketCodecs.VAR_INT, SlowPayload::tps,
+                      SlowPayload::new);
+
+              @Override
+              public CustomPayload.Id<? extends CustomPayload> getId() {
+                  return ID;
+              }
           }
           EOF
 
@@ -105,40 +133,120 @@ jobs:
 
           import net.fabricmc.api.ModInitializer;
           import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
-          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+          import net.fabricmc.fabric.api.event.player.AttackBlockCallback;
+          import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+          import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+          import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+          import net.minecraft.block.BlockState;
           import net.minecraft.component.DataComponentTypes;
           import net.minecraft.component.type.NbtComponent;
           import net.minecraft.item.ItemStack;
           import net.minecraft.item.Items;
           import net.minecraft.nbt.NbtCompound;
           import net.minecraft.server.MinecraftServer;
-          import net.minecraft.server.ServerTickManager;
           import net.minecraft.server.command.CommandManager;
           import net.minecraft.server.network.ServerPlayerEntity;
           import net.minecraft.text.Style;
           import net.minecraft.text.Text;
+          import net.minecraft.util.ActionResult;
           import net.minecraft.util.Formatting;
+
+          import java.util.UUID;
 
           public class TimeStopMod implements ModInitializer {
 
               private static final String TAG = "timestop_compass";
-              private static final float SLOW_TPS = 2.0f;
-              private static final float NORMAL_TPS = 20.0f;
 
-              private boolean slowed = false;
+              public static volatile boolean slowActive = false;
+              private static UUID activator = null;
 
               @Override
               public void onInitialize() {
+                  PayloadTypeRegistry.playC2S().register(SlowPayload.ID, SlowPayload.CODEC);
+
+                  // Menu sends: on/off + speed
+                  ServerPlayNetworking.registerGlobalReceiver(SlowPayload.ID, (payload, context) -> {
+                      ServerPlayerEntity player = context.player();
+                      MinecraftServer server = context.server();
+                      if (!isTimeStop(player.getMainHandStack()) && !isTimeStop(player.getOffHandStack())) return;
+                      applySlow(server, player, payload.active(), payload.tps());
+                  });
+
+                  // /timestop = give compass, /timestop reset = back to normal speed
                   CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) ->
-                      dispatcher.register(CommandManager.literal("timestop").executes(ctx -> {
-                          ServerPlayerEntity player = ctx.getSource().getPlayerOrThrow();
-                          player.giveItemStack(createCompass());
-                          ctx.getSource().sendFeedback(
-                              () -> Text.literal("You received the TIME STOP compass."), false);
-                          return 1;
-                      }))
+                      dispatcher.register(
+                          CommandManager.literal("timestop")
+                              .executes(ctx -> {
+                                  ServerPlayerEntity player = ctx.getSource().getPlayerOrThrow();
+                                  player.giveItemStack(createCompass());
+                                  ctx.getSource().sendFeedback(
+                                      () -> Text.literal("You received the TIME STOP compass."), false);
+                                  return 1;
+                              })
+                              .then(CommandManager.literal("reset").executes(ctx -> {
+                                  reset(ctx.getSource().getServer());
+                                  ctx.getSource().sendFeedback(
+                                      () -> Text.literal("Slow motion reset to normal speed."), false);
+                                  return 1;
+                              }))
+                      )
                   );
-                  ServerTickEvents.END_SERVER_TICK.register(this::onServerTick);
+
+                  ServerLifecycleEvents.SERVER_STARTED.register(server -> {
+                      slowActive = false;
+                      activator = null;
+                  });
+
+                  // Give the compass when joining
+                  ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
+                      ServerPlayerEntity p = handler.getPlayer();
+                      boolean has = false;
+                      for (int i = 0; i < p.getInventory().size(); i++) {
+                          if (isTimeStop(p.getInventory().getStack(i))) {
+                              has = true;
+                              break;
+                          }
+                      }
+                      if (!has) p.giveItemStack(createCompass());
+                  });
+
+                  // If the player who started slow motion leaves, go back to normal
+                  ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
+                      if (slowActive && handler.getPlayer().getUuid().equals(activator)) {
+                          reset(server);
+                      }
+                  });
+
+                  // Instant block breaking while slow motion is active
+                  AttackBlockCallback.EVENT.register((player, world, hand, pos, direction) -> {
+                      if (world.isClient || !slowActive) return ActionResult.PASS;
+                      if (!(player instanceof ServerPlayerEntity sp)) return ActionResult.PASS;
+                      if (sp.isSpectator() || sp.isCreative()) return ActionResult.PASS;
+                      BlockState state = world.getBlockState(pos);
+                      if (state.isAir() || state.getHardness(world, pos) < 0) return ActionResult.PASS;
+                      sp.interactionManager.tryBreakBlock(pos);
+                      return ActionResult.SUCCESS;
+                  });
+              }
+
+              private static void applySlow(MinecraftServer server, ServerPlayerEntity player, boolean active, int tpsIn) {
+                  int tps = Math.max(1, Math.min(20, tpsIn));
+                  if (active && tps < 20) {
+                      slowActive = true;
+                      activator = player.getUuid();
+                      server.getTickManager().setTickRate((float) tps);
+                      player.sendMessage(Text.literal("Slow motion ON: " + tps + " TPS"), true);
+                  } else {
+                      reset(server);
+                      player.sendMessage(Text.literal("Slow motion OFF"), true);
+                  }
+              }
+
+              private static void reset(MinecraftServer server) {
+                  slowActive = false;
+                  activator = null;
+                  server.getTickManager().setTickRate(20.0f);
               }
 
               public static ItemStack createCompass() {
@@ -153,26 +261,215 @@ jobs:
                   return stack;
               }
 
-              private static boolean isTimeStop(ItemStack stack) {
+              public static boolean isTimeStop(ItemStack stack) {
                   if (stack.isEmpty() || !stack.isOf(Items.COMPASS)) return false;
                   return stack.getOrDefault(DataComponentTypes.CUSTOM_DATA, NbtComponent.DEFAULT).contains(TAG);
               }
+          }
+          EOF
 
-              private void onServerTick(MinecraftServer server) {
-                  boolean holding = false;
-                  for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
-                      if (isTimeStop(player.getMainHandStack()) || isTimeStop(player.getOffHandStack())) {
-                          holding = true;
-                          break;
+          cat > src/main/java/com/example/timestop/client/TimeStopClient.java <<'EOF'
+          package com.example.timestop.client;
+
+          import com.example.timestop.TimeStopMod;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.event.player.UseItemCallback;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.util.TypedActionResult;
+
+          public class TimeStopClient implements ClientModInitializer {
+
+              public static int lastTps = 2;
+
+              public static boolean isSlow() {
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  return mc.world != null && mc.world.getTickManager().getTickRate() < 19.9f;
+              }
+
+              @Override
+              public void onInitializeClient() {
+                  // Right-click the compass = open the menu
+                  UseItemCallback.EVENT.register((player, world, hand) -> {
+                      ItemStack stack = player.getStackInHand(hand);
+                      if (world.isClient && TimeStopMod.isTimeStop(stack)) {
+                          MinecraftClient.getInstance().setScreen(new TimeStopScreen());
+                          return TypedActionResult.success(stack);
+                      }
+                      return TypedActionResult.pass(stack);
+                  });
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/timestop/client/TimeStopScreen.java <<'EOF'
+          package com.example.timestop.client;
+
+          import com.example.timestop.SlowPayload;
+          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.gui.widget.SliderWidget;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.Formatting;
+
+          public class TimeStopScreen extends Screen {
+
+              private boolean active;
+              private int tps;
+              private int lastSentTps = -1;
+
+              public TimeStopScreen() {
+                  super(Text.literal("TIME STOP"));
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  float rate = mc.world != null ? mc.world.getTickManager().getTickRate() : 20.0f;
+                  active = rate < 19.9f;
+                  int t = active ? Math.round(rate) : TimeStopClient.lastTps;
+                  tps = Math.max(1, Math.min(20, t));
+              }
+
+              private Text toggleLabel() {
+                  return active
+                      ? Text.literal("STOP SLOWMOTION").formatted(Formatting.RED)
+                      : Text.literal("START SLOWMOTION").formatted(Formatting.GREEN);
+              }
+
+              private void send() {
+                  ClientPlayNetworking.send(new SlowPayload(active, tps));
+                  lastSentTps = tps;
+              }
+
+              @Override
+              protected void init() {
+                  int cx = this.width / 2;
+                  int y = this.height / 2 - 30;
+
+                  addDrawableChild(ButtonWidget.builder(toggleLabel(), b -> {
+                      active = !active;
+                      send();
+                      b.setMessage(toggleLabel());
+                  }).dimensions(cx - 100, y, 200, 20).build());
+
+                  addDrawableChild(new SpeedSlider(cx - 100, y + 28, 200, 20, tps));
+
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Close"), b -> close())
+                      .dimensions(cx - 100, y + 56, 200, 20).build());
+              }
+
+              @Override
+              public boolean shouldPause() {
+                  return false;
+              }
+
+              @Override
+              public void render(DrawContext ctx, int mouseX, int mouseY, float delta) {
+                  super.render(ctx, mouseX, mouseY, delta);
+                  ctx.drawCenteredTextWithShadow(this.textRenderer,
+                      Text.literal("TIME STOP").formatted(Formatting.AQUA, Formatting.BOLD),
+                      this.width / 2, this.height / 2 - 60, 0xFFFFFF);
+                  ctx.drawCenteredTextWithShadow(this.textRenderer,
+                      Text.literal("1 = very slow, 20 = normal speed"),
+                      this.width / 2, this.height / 2 + 52, 0xAAAAAA);
+              }
+
+              private class SpeedSlider extends SliderWidget {
+                  SpeedSlider(int x, int y, int w, int h, int startTps) {
+                      super(x, y, w, h, Text.empty(), (startTps - 1) / 19.0);
+                      updateMessage();
+                  }
+
+                  private int valueToTps() {
+                      return 1 + (int) Math.round(this.value * 19.0);
+                  }
+
+                  @Override
+                  protected void updateMessage() {
+                      setMessage(Text.literal("Slow motion: " + valueToTps() + " TPS"));
+                  }
+
+                  @Override
+                  protected void applyValue() {
+                      tps = valueToTps();
+                      TimeStopClient.lastTps = tps;
+                      this.value = (tps - 1) / 19.0;
+                      if (active && tps != lastSentTps) send();
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/timestop/mixin/MinecraftClientMixin.java <<'EOF'
+          package com.example.timestop.mixin;
+
+          import com.example.timestop.client.TimeStopClient;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.network.ClientPlayerEntity;
+          import net.minecraft.client.network.ClientPlayerInteractionManager;
+          import net.minecraft.client.option.GameOptions;
+          import net.minecraft.util.Util;
+          import net.minecraft.util.hit.HitResult;
+          import org.spongepowered.asm.mixin.Final;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.Shadow;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+          @Mixin(MinecraftClient.class)
+          public abstract class MinecraftClientMixin {
+
+              @Shadow public ClientPlayerEntity player;
+              @Shadow public ClientPlayerInteractionManager interactionManager;
+              @Shadow public Screen currentScreen;
+              @Shadow public HitResult crosshairTarget;
+              @Shadow @Final public GameOptions options;
+              @Shadow private int attackCooldown;
+
+              @Shadow protected abstract boolean doAttack();
+              @Shadow protected abstract void doItemUse();
+
+              private long timestop$lastUse = 0L;
+              private long timestop$lastAttack = 0L;
+
+              // Runs every FRAME (not every slowed tick), so clicks have no delay
+              @Inject(method = "render", at = @At("HEAD"), require = 0)
+              private void timestop$instantActions(boolean tick, CallbackInfo ci) {
+                  if (this.player == null || this.interactionManager == null || this.currentScreen != null) return;
+                  if (!TimeStopClient.isSlow()) return;
+
+                  long now = Util.getMeasuringTimeMs();
+
+                  // Place / use
+                  if (!this.player.isUsingItem()) {
+                      while (this.options.useKey.wasPressed()) {
+                          this.doItemUse();
+                          this.timestop$lastUse = now;
+                      }
+                      if (this.currentScreen == null
+                          && this.options.useKey.isPressed()
+                          && now - this.timestop$lastUse > 150) {
+                          this.doItemUse();
+                          this.timestop$lastUse = now;
                       }
                   }
-                  ServerTickManager tickManager = server.getTickManager();
-                  if (holding && !slowed) {
-                      tickManager.setTickRate(SLOW_TPS);
-                      slowed = true;
-                  } else if (!holding && slowed) {
-                      tickManager.setTickRate(NORMAL_TPS);
-                      slowed = false;
+
+                  // Break / attack
+                  while (this.options.attackKey.wasPressed()) {
+                      this.attackCooldown = 0;
+                      this.doAttack();
+                      this.timestop$lastAttack = now;
+                  }
+                  if (this.currentScreen == null
+                      && this.options.attackKey.isPressed()
+                      && now - this.timestop$lastAttack > 150
+                      && this.crosshairTarget != null
+                      && this.crosshairTarget.getType() == HitResult.Type.BLOCK) {
+                      this.attackCooldown = 0;
+                      this.doAttack();
+                      this.timestop$lastAttack = now;
                   }
               }
           }
